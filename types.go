@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/apache/arrow/go/v16/arrow/decimal128"
 	"golang.org/x/exp/slices"
 )
 
@@ -407,6 +408,11 @@ func (f FixedType) Equals(other Type) bool {
 func (f FixedType) Len() int       { return f.len }
 func (f FixedType) Type() string   { return fmt.Sprintf("fixed[%d]", f.len) }
 func (f FixedType) String() string { return fmt.Sprintf("fixed[%d]", f.len) }
+
+type Decimal struct {
+	Val   decimal128.Num
+	Scale int
+}
 
 func DecimalTypeOf(prec, scale int) DecimalType {
 	return DecimalType{precision: prec, scale: scale}
