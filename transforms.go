@@ -76,6 +76,13 @@ type Transform interface {
 	ResultType(t Type) Type
 }
 
+type TypedTransform[S, T literalType] interface {
+	Transform
+
+	Equals(TypedTransform[S, T]) bool
+	Bind(t Type) (func(optional[S]) (optional[T], error), error)
+}
+
 // IdentityTransform uses the identity function, performing no transformation
 // but instead partitioning on the value itself.
 type IdentityTransform struct{}

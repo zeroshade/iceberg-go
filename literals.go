@@ -19,6 +19,7 @@ package iceberg
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
@@ -28,13 +29,24 @@ import (
 	"github.com/apache/arrow/go/v16/arrow"
 	"github.com/apache/arrow/go/v16/arrow/decimal128"
 	"github.com/google/uuid"
-	"golang.org/x/exp/constraints"
 )
 
 var (
 	ErrBadCastLiteral = errors.New("could not cast literal")
 	ErrBadLiteral     = errors.New("invalid literal value")
 )
+
+type Comparator[T literalType] func(v1, v2 T) int
+
+func nullsFirstCmp[T literalType](cmp Comparator[T], v1, v2 optional[T]) int {
+	if v1.isValid {
+		if v2.isValid {
+			return cmp(v1.val, v2.val)
+		}
+		return 1
+	}
+	return -1
+}
 
 type Literal interface {
 	fmt.Stringer
@@ -51,6 +63,18 @@ type OrderedLiteral interface {
 	LessEqual(Literal) bool
 	Greater(Literal) bool
 	GreaterEqual(Literal) bool
+}
+
+type AboveMaxLiteral interface {
+	Literal
+
+	aboveMax()
+}
+
+type BelowMinLiteral interface {
+	Literal
+
+	belowMin()
 }
 
 type literalType interface {
@@ -98,13 +122,25 @@ func NewLiteral[T literalType](val T) (Literal, error) {
 }
 
 type TypedLiteral[T literalType] interface {
+	Literal
+
 	Value() T
+	Comparator() Comparator[T]
+	createSet(...T) set[T]
+}
+
+func setOfLits[T literalType](vals ...TypedLiteral[T]) set[T] {
+	s := ((TypedLiteral[T])(nil)).createSet()
+	for _, v := range vals {
+		s.add(v.Value())
+	}
+	return s
 }
 
 type cmpLiteral interface {
 	literalType
 	comparable
-	constraints.Ordered
+	cmp.Ordered
 }
 
 func literalEq[T cmpLiteral](lhs TypedLiteral[T], other Literal) bool {
@@ -156,6 +192,8 @@ type aboveMaxLiteral[T int32 | int64 | float32 | float64] struct {
 	value T
 }
 
+func (ab aboveMaxLiteral[T]) aboveMax() {}
+
 func (ab aboveMaxLiteral[T]) Type() Type {
 	var z T
 	switch any(z).(type) {
@@ -173,32 +211,26 @@ func (ab aboveMaxLiteral[T]) Type() Type {
 }
 
 func (ab aboveMaxLiteral[T]) To(t Type) (Literal, error) {
-	return nil, nil
+	if ab.Type().Equals(t) {
+		return ab, nil
+	}
+	return nil, fmt.Errorf("%w: cannot change type of AboveMaxLiteral",
+		ErrBadCastLiteral)
 }
 
 func (ab aboveMaxLiteral[T]) Value() T { return ab.value }
 
 func (ab aboveMaxLiteral[T]) String() string { return "AboveMax" }
 func (ab aboveMaxLiteral[T]) Equals(other Literal) bool {
-	return literalEq(ab, other)
-}
-func (ab aboveMaxLiteral[T]) Less(other Literal) bool {
-	return literalLt(ab, other)
-}
-
-func (ab aboveMaxLiteral[T]) LessEqual(other Literal) bool {
-	return literalLte(ab, other)
-}
-func (ab aboveMaxLiteral[T]) Greater(other Literal) bool {
-	return literalGt(ab, other)
-}
-func (ab aboveMaxLiteral[T]) GreaterEqual(other Literal) bool {
-	return literalGte(ab, other)
+	_, ok := other.(aboveMaxLiteral[T])
+	return ok
 }
 
 type belowMinLiteral[T int32 | int64 | float32 | float64] struct {
 	value T
 }
+
+func (bm belowMinLiteral[T]) belowMin() {}
 
 func (bm belowMinLiteral[T]) Type() Type {
 	var z T
@@ -217,27 +249,19 @@ func (bm belowMinLiteral[T]) Type() Type {
 }
 
 func (bm belowMinLiteral[T]) To(t Type) (Literal, error) {
-	return nil, nil
+	if bm.Type().Equals(t) {
+		return bm, nil
+	}
+	return nil, fmt.Errorf("%w: cannot change type of BelowMinLiteral",
+		ErrBadCastLiteral)
 }
 
 func (bm belowMinLiteral[T]) Value() T { return bm.value }
 
 func (bm belowMinLiteral[T]) String() string { return "BelowMin" }
 func (bm belowMinLiteral[T]) Equals(other Literal) bool {
-	return literalEq(bm, other)
-}
-func (bm belowMinLiteral[T]) Less(other Literal) bool {
-	return literalLt(bm, other)
-}
-
-func (bm belowMinLiteral[T]) LessEqual(other Literal) bool {
-	return literalLte(bm, other)
-}
-func (bm belowMinLiteral[T]) Greater(other Literal) bool {
-	return literalGt(bm, other)
-}
-func (bm belowMinLiteral[T]) GreaterEqual(other Literal) bool {
-	return literalGte(bm, other)
+	_, ok := other.(belowMinLiteral[T])
+	return ok
 }
 
 func Int32AboveMaxLiteral() Literal {
@@ -274,6 +298,19 @@ func Float64BelowMinLiteral() Literal {
 
 type BoolLiteral bool
 
+func (BoolLiteral) createSet(vals ...bool) set[bool] { return newset(vals...) }
+func (BoolLiteral) Comparator() Comparator[bool] {
+	return func(v1, v2 bool) int {
+		if v1 {
+			if v2 {
+				return 0
+			}
+			return 1
+		}
+		return -1
+	}
+}
+
 func (b BoolLiteral) Type() Type     { return PrimitiveTypes.Bool }
 func (b BoolLiteral) Value() bool    { return bool(b) }
 func (b BoolLiteral) String() string { return strconv.FormatBool(bool(b)) }
@@ -295,9 +332,11 @@ func (b BoolLiteral) Equals(l Literal) bool {
 
 type Int32Literal int32
 
-func (i Int32Literal) Type() Type     { return PrimitiveTypes.Int32 }
-func (i Int32Literal) Value() int32   { return int32(i) }
-func (i Int32Literal) String() string { return strconv.FormatInt(int64(i), 10) }
+func (Int32Literal) createSet(vals ...int32) set[int32] { return newset(vals...) }
+func (Int32Literal) Comparator() Comparator[int32]      { return cmp.Compare[int32] }
+func (i Int32Literal) Type() Type                       { return PrimitiveTypes.Int32 }
+func (i Int32Literal) Value() int32                     { return int32(i) }
+func (i Int32Literal) String() string                   { return strconv.FormatInt(int64(i), 10) }
 func (i Int32Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
 	case Int32Type:
@@ -354,9 +393,11 @@ func (i Int32Literal) GreaterEqual(other Literal) bool {
 
 type Int64Literal int64
 
-func (i Int64Literal) Type() Type     { return PrimitiveTypes.Int64 }
-func (i Int64Literal) Value() int64   { return int64(i) }
-func (i Int64Literal) String() string { return strconv.FormatInt(int64(i), 10) }
+func (Int64Literal) createSet(vals ...int64) set[int64] { return newset(vals...) }
+func (Int64Literal) Comparator() Comparator[int64]      { return cmp.Compare[int64] }
+func (i Int64Literal) Type() Type                       { return PrimitiveTypes.Int64 }
+func (i Int64Literal) Value() int64                     { return int64(i) }
+func (i Int64Literal) String() string                   { return strconv.FormatInt(int64(i), 10) }
 func (i Int64Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
 	case Int32Type:
@@ -418,9 +459,11 @@ func (i Int64Literal) GreaterEqual(other Literal) bool {
 
 type Float32Literal float32
 
-func (f Float32Literal) Type() Type     { return PrimitiveTypes.Float32 }
-func (f Float32Literal) Value() float32 { return float32(f) }
-func (f Float32Literal) String() string { return strconv.FormatFloat(float64(f), 'g', -1, 32) }
+func (Float32Literal) createSet(vals ...float32) set[float32] { return newset(vals...) }
+func (Float32Literal) Comparator() Comparator[float32]        { return cmp.Compare[float32] }
+func (f Float32Literal) Type() Type                           { return PrimitiveTypes.Float32 }
+func (f Float32Literal) Value() float32                       { return float32(f) }
+func (f Float32Literal) String() string                       { return strconv.FormatFloat(float64(f), 'g', -1, 32) }
 func (f Float32Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
 	case Float32Type:
@@ -455,9 +498,11 @@ func (f Float32Literal) GreaterEqual(other Literal) bool {
 
 type Float64Literal float64
 
-func (f Float64Literal) Type() Type     { return PrimitiveTypes.Float64 }
-func (f Float64Literal) Value() float64 { return float64(f) }
-func (f Float64Literal) String() string { return strconv.FormatFloat(float64(f), 'g', -1, 64) }
+func (Float64Literal) createSet(vals ...float64) set[float64] { return newset(vals...) }
+func (Float64Literal) Comparator() Comparator[float64]        { return cmp.Compare[float64] }
+func (f Float64Literal) Type() Type                           { return PrimitiveTypes.Float64 }
+func (f Float64Literal) Value() float64                       { return float64(f) }
+func (f Float64Literal) String() string                       { return strconv.FormatFloat(float64(f), 'g', -1, 64) }
 func (f Float64Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
 	case Float32Type:
@@ -497,8 +542,10 @@ func (f Float64Literal) GreaterEqual(other Literal) bool {
 
 type DateLiteral Date
 
-func (d DateLiteral) Type() Type  { return PrimitiveTypes.Date }
-func (d DateLiteral) Value() Date { return Date(d) }
+func (DateLiteral) createSet(vals ...Date) set[Date] { return newset(vals...) }
+func (DateLiteral) Comparator() Comparator[Date]     { return cmp.Compare[Date] }
+func (d DateLiteral) Type() Type                     { return PrimitiveTypes.Date }
+func (d DateLiteral) Value() Date                    { return Date(d) }
 func (d DateLiteral) String() string {
 	t := time.Unix(0, 0).UTC().AddDate(0, 0, int(d))
 	return t.Format("2006-01-02")
@@ -528,8 +575,10 @@ func (d DateLiteral) GreaterEqual(other Literal) bool {
 
 type TimeLiteral Time
 
-func (t TimeLiteral) Type() Type  { return PrimitiveTypes.Time }
-func (t TimeLiteral) Value() Time { return Time(t) }
+func (TimeLiteral) createSet(vals ...Time) set[Time] { return newset(vals...) }
+func (TimeLiteral) Comparator() Comparator[Time]     { return cmp.Compare[Time] }
+func (t TimeLiteral) Type() Type                     { return PrimitiveTypes.Time }
+func (t TimeLiteral) Value() Time                    { return Time(t) }
 func (t TimeLiteral) String() string {
 	tm := time.UnixMicro(int64(t)).UTC()
 	return tm.Format("15:04:05.000000")
@@ -560,8 +609,10 @@ func (t TimeLiteral) GreaterEqual(other Literal) bool {
 
 type TimestampLiteral Timestamp
 
-func (t TimestampLiteral) Type() Type       { return PrimitiveTypes.Timestamp }
-func (t TimestampLiteral) Value() Timestamp { return Timestamp(t) }
+func (TimestampLiteral) createSet(vals ...Timestamp) set[Timestamp] { return newset(vals...) }
+func (TimestampLiteral) Comparator() Comparator[Timestamp]          { return cmp.Compare[Timestamp] }
+func (t TimestampLiteral) Type() Type                               { return PrimitiveTypes.Timestamp }
+func (t TimestampLiteral) Value() Timestamp                         { return Timestamp(t) }
 func (t TimestampLiteral) String() string {
 	tm := time.UnixMicro(int64(t)).UTC()
 	return tm.Format("2006-01-02 15:04:05.000000")
@@ -596,9 +647,11 @@ func (t TimestampLiteral) GreaterEqual(other Literal) bool {
 
 type StringLiteral string
 
-func (s StringLiteral) Type() Type     { return PrimitiveTypes.String }
-func (s StringLiteral) Value() string  { return string(s) }
-func (s StringLiteral) String() string { return string(s) }
+func (StringLiteral) createSet(vals ...string) set[string] { return newset(vals...) }
+func (StringLiteral) Comparator() Comparator[string]       { return cmp.Compare[string] }
+func (s StringLiteral) Type() Type                         { return PrimitiveTypes.String }
+func (s StringLiteral) Value() string                      { return string(s) }
+func (s StringLiteral) String() string                     { return string(s) }
 func (s StringLiteral) To(typ Type) (Literal, error) {
 	switch t := typ.(type) {
 	case StringType:
@@ -702,6 +755,10 @@ func (s StringLiteral) GreaterEqual(other Literal) bool {
 
 type BinaryLiteral []byte
 
+func (BinaryLiteral) createSet(vals ...[]byte) set[[]byte] { return newByteSliceSet(vals...) }
+func (BinaryLiteral) Comparator() Comparator[[]byte] {
+	return bytes.Compare
+}
 func (b BinaryLiteral) Type() Type     { return PrimitiveTypes.Binary }
 func (b BinaryLiteral) Value() []byte  { return []byte(b) }
 func (b BinaryLiteral) String() string { return string(b) }
@@ -770,9 +827,11 @@ func (b BinaryLiteral) GreaterEqual(other Literal) bool {
 
 type FixedLiteral []byte
 
-func (f FixedLiteral) Type() Type     { return FixedTypeOf(len(f)) }
-func (f FixedLiteral) Value() []byte  { return []byte(f) }
-func (f FixedLiteral) String() string { return string(f) }
+func (FixedLiteral) createSet(vals ...[]byte) set[[]byte] { return newByteSliceSet(vals...) }
+func (FixedLiteral) Comparator() Comparator[[]byte]       { return bytes.Compare }
+func (f FixedLiteral) Type() Type                         { return FixedTypeOf(len(f)) }
+func (f FixedLiteral) Value() []byte                      { return []byte(f) }
+func (f FixedLiteral) String() string                     { return string(f) }
 func (f FixedLiteral) To(typ Type) (Literal, error) {
 	switch t := typ.(type) {
 	case UUIDType:
@@ -839,6 +898,13 @@ func (f FixedLiteral) GreaterEqual(other Literal) bool {
 
 type UUIDLiteral uuid.UUID
 
+func (UUIDLiteral) createSet(vals ...uuid.UUID) set[uuid.UUID] { return newset(vals...) }
+func (UUIDLiteral) Comparator() Comparator[uuid.UUID] {
+	return func(v1, v2 uuid.UUID) int {
+		return bytes.Compare(v1[:], v2[:])
+	}
+}
+
 func (UUIDLiteral) Type() Type         { return PrimitiveTypes.UUID }
 func (u UUIDLiteral) Value() uuid.UUID { return uuid.UUID(u) }
 func (u UUIDLiteral) String() string   { return uuid.UUID(u).String() }
@@ -872,6 +938,21 @@ func (u UUIDLiteral) Equals(other Literal) bool {
 
 type DecimalLiteral Decimal
 
+func (DecimalLiteral) createSet(vals ...Decimal) set[Decimal] { return newset(vals...) }
+func (DecimalLiteral) Comparator() Comparator[Decimal] {
+	return func(v1, v2 Decimal) int {
+		if v1.Scale == v2.Scale {
+			return v1.Val.Cmp(v2.Val)
+		}
+
+		rescaled, err := v2.Val.Rescale(int32(v2.Scale), int32(v1.Scale))
+		if err != nil {
+			return -1
+		}
+
+		return v1.Val.Cmp(rescaled)
+	}
+}
 func (d DecimalLiteral) Type() Type     { return DecimalTypeOf(9, d.Scale) }
 func (d DecimalLiteral) Value() Decimal { return Decimal(d) }
 func (d DecimalLiteral) String() string {
