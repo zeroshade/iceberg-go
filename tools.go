@@ -15,17 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iceberg
+//go:build tools
 
-import "errors"
+package tools
 
-var (
-	ErrInvalidTypeString = errors.New("invalid type")
-	ErrNotImplemented    = errors.New("not implemented")
-	ErrInvalidArgument   = errors.New("invalid argument")
-	ErrInvalidSchema     = errors.New("invalid schema")
-	ErrInvalidTransform  = errors.New("invalid transform syntax")
-	ErrType              = errors.New("type error")
-	ErrBadCast           = errors.New("could not cast value")
-	ErrBadLiteral        = errors.New("invalid literal value")
+import (
+	_ "golang.org/x/tools/cmd/stringer"
 )

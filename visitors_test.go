@@ -15,17 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iceberg
-
-import "errors"
-
-var (
-	ErrInvalidTypeString = errors.New("invalid type")
-	ErrNotImplemented    = errors.New("not implemented")
-	ErrInvalidArgument   = errors.New("invalid argument")
-	ErrInvalidSchema     = errors.New("invalid schema")
-	ErrInvalidTransform  = errors.New("invalid transform syntax")
-	ErrType              = errors.New("type error")
-	ErrBadCast           = errors.New("could not cast value")
-	ErrBadLiteral        = errors.New("invalid literal value")
-)
+package iceberg_test
