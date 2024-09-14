@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/apache/arrow/go/v16/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"golang.org/x/exp/slices"
 )
 
@@ -505,6 +505,10 @@ func (Float64Type) Type() string   { return "double" }
 func (Float64Type) String() string { return "double" }
 
 type Date int32
+
+func DateFromTime(tm time.Time) Date {
+	return Date(tm.Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
+}
 
 func (d Date) ToTime() time.Time {
 	return epochTM.AddDate(0, 0, int(d))

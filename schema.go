@@ -427,6 +427,23 @@ type AfterMapValueVisitor interface {
 	AfterMapValue(value NestedField)
 }
 
+type VisitPerPrimitiveType[T any] interface {
+	VisitFixed(FixedType) T
+	VisitDecimal(DecimalType) T
+	VisitBoolean() T
+	VisitInt32() T
+	VisitInt64() T
+	VisitFloat32() T
+	VisitFloat64() T
+	VisitDate() T
+	VisitTime() T
+	VisitTimestamp() T
+	VisitTimestampTz() T
+	VisitString() T
+	VisitUUID() T
+	VisitBinary() T
+}
+
 // Visit accepts a visitor and performs a post-order traversal of the given schema.
 func Visit[T any](sc *Schema, visitor SchemaVisitor[T]) (res T, err error) {
 	if sc == nil {
@@ -534,6 +551,38 @@ func visitField[T any](f NestedField, visitor SchemaVisitor[T]) T {
 	case *MapType:
 		return visitMap(*typ, visitor)
 	default: // primitive
+		if perprimitive, ok := visitor.(VisitPerPrimitiveType[T]); ok {
+			switch t := typ.(type) {
+			case BooleanType:
+				return perprimitive.VisitBoolean()
+			case Int32Type:
+				return perprimitive.VisitInt32()
+			case Int64Type:
+				return perprimitive.VisitInt64()
+			case Float32Type:
+				return perprimitive.VisitFloat32()
+			case Float64Type:
+				return perprimitive.VisitFloat64()
+			case DateType:
+				return perprimitive.VisitDate()
+			case TimeType:
+				return perprimitive.VisitTime()
+			case TimestampType:
+				return perprimitive.VisitTimestamp()
+			case TimestampTzType:
+				return perprimitive.VisitTimestampTz()
+			case StringType:
+				return perprimitive.VisitString()
+			case BinaryType:
+				return perprimitive.VisitBinary()
+			case UUIDType:
+				return perprimitive.VisitUUID()
+			case DecimalType:
+				return perprimitive.VisitDecimal(t)
+			case FixedType:
+				return perprimitive.VisitFixed(t)
+			}
+		}
 		return visitor.Primitive(typ.(PrimitiveType))
 	}
 }

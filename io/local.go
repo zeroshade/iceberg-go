@@ -18,6 +18,7 @@
 package io
 
 import (
+	"io/fs"
 	"os"
 	"strings"
 )
@@ -26,8 +27,12 @@ import (
 // the local file system.
 type LocalFS struct{}
 
-func (LocalFS) Open(name string) (File, error) {
+func (LocalFS) Open(name string) (fs.File, error) {
 	return os.Open(strings.TrimPrefix(name, "file://"))
+}
+
+func (LocalFS) Stat(name string) (fs.FileInfo, error) {
+	return os.Stat(strings.TrimPrefix(name, "file://"))
 }
 
 func (LocalFS) Remove(name string) error {

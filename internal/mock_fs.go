@@ -22,7 +22,6 @@ import (
 	"errors"
 	"io/fs"
 
-	"github.com/apache/iceberg-go/io"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -30,9 +29,14 @@ type MockFS struct {
 	mock.Mock
 }
 
-func (m *MockFS) Open(name string) (io.File, error) {
+func (m *MockFS) Open(name string) (fs.File, error) {
 	args := m.Called(name)
-	return args.Get(0).(io.File), args.Error(1)
+	return args.Get(0).(fs.File), args.Error(1)
+}
+
+func (m *MockFS) Stat(name string) (fs.FileInfo, error) {
+	args := m.Called(name)
+	return args.Get(0).(fs.FileInfo), args.Error(1)
 }
 
 func (m *MockFS) Remove(name string) error {

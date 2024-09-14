@@ -25,6 +25,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/io"
 )
@@ -386,6 +387,36 @@ Loop:
 	}
 
 	return results, nil
+}
+
+func (s *Scan) ToArrow(ctx context.Context) (arrow.Table, error) {
+	tasks, err := s.PlanFiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var boundFilter iceberg.BooleanExpression
+	if s.rowFilter != nil {
+		boundFilter, err = iceberg.BindExpr(s.metadata.CurrentSchema(),
+			s.rowFilter, s.caseSensitive)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	schema, err := s.Projection()
+	if err != nil {
+		return nil, err
+	}
+
+	return (&arrowScan{
+		metadata:        s.metadata,
+		fs:              s.io,
+		projectedSchema: schema,
+		boundRowFilter:  boundFilter,
+		caseSensitive:   s.caseSensitive,
+		rowLimit:        -1,
+	}).ToTable(tasks)
 }
 
 type FileScanTask struct {

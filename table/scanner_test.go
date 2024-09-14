@@ -21,6 +21,7 @@ package table_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -81,6 +82,27 @@ func TestScanner(t *testing.T) {
 	}
 }
 
+func TestScanning(t *testing.T) {
+	cat, err := catalog.NewRestCatalog("rest", "http://localhost:8181")
+	require.NoError(t, err)
+
+	props := iceberg.Properties{
+		io.S3Region:      "us-east-1",
+		io.S3AccessKeyID: "admin", io.S3SecretAccessKey: "password"}
+
+	ident := catalog.ToRestIdentifier("default", "test_positional_mor_deletes")
+
+	tbl, err := cat.LoadTable(context.Background(), ident, props)
+	require.NoError(t, err)
+
+	scan := tbl.Scan(
+		iceberg.GreaterThanEqual(iceberg.Reference("letter"), "e"),
+		0, true, "number")
+	result, err := scan.ToArrow(context.Background())
+	fmt.Println(err)
+	fmt.Println(result)
+}
+
 func TestScannerWithDeletes(t *testing.T) {
 	cat, err := catalog.NewRestCatalog("rest", "http://localhost:8181")
 	require.NoError(t, err)
@@ -100,6 +122,8 @@ func TestScannerWithDeletes(t *testing.T) {
 
 	assert.Len(t, tasks, 1)
 	assert.Len(t, tasks[0].DeleteFiles, 1)
+
+	fmt.Println(tasks[0].File)
 
 	tagScan, err := scan.UseRef("tag_12")
 	require.NoError(t, err)

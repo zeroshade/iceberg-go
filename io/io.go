@@ -42,7 +42,9 @@ type IO interface {
 	// Open should reject attempts to open names that do not satisfy
 	// fs.ValidPath(name), returning a *PathError with Err set to
 	// ErrInvalid or ErrNotExist.
-	Open(name string) (File, error)
+	Open(name string) (fs.File, error)
+
+	Stat(name string) (fs.FileInfo, error)
 
 	// Remove removes the named file or (empty) directory.
 	//
@@ -70,8 +72,8 @@ type ReadFileIO interface {
 // Directory files should also implement
 type File interface {
 	fs.File
-	io.ReadSeekCloser
-	io.ReaderAt
+	// io.ReadSeekCloser
+	// io.ReaderAt
 }
 
 // A ReadDirFile is a directory file whose entries can be read with the
@@ -101,7 +103,7 @@ type ReadDirFile interface {
 }
 
 // FS wraps an io/fs.FS as an IO interface.
-func FS(fsys fs.FS) IO {
+func FS(fsys fs.StatFS) IO {
 	if _, ok := fsys.(fs.ReadFileFS); ok {
 		return readFileFS{ioFS{fsys, nil}}
 	}
@@ -111,7 +113,7 @@ func FS(fsys fs.FS) IO {
 // FSPreProcName wraps an io/fs.FS like FS, only if fn is non-nil then
 // it is called to preprocess any filenames before they are passed to
 // the underlying fsys.
-func FSPreProcName(fsys fs.FS, fn func(string) string) IO {
+func FSPreProcName(fsys fs.StatFS, fn func(string) string) IO {
 	if _, ok := fsys.(fs.ReadFileFS); ok {
 		return readFileFS{ioFS{fsys, fn}}
 	}
@@ -135,12 +137,12 @@ func (r readFileFS) ReadFile(name string) ([]byte, error) {
 }
 
 type ioFS struct {
-	fsys fs.FS
+	fsys fs.StatFS
 
 	preProcessName func(string) string
 }
 
-func (f ioFS) Open(name string) (File, error) {
+func (f ioFS) Open(name string) (fs.File, error) {
 	if f.preProcessName != nil {
 		name = f.preProcessName(name)
 	}
@@ -156,6 +158,32 @@ func (f ioFS) Open(name string) (File, error) {
 	}
 
 	return ioFile{file}, nil
+}
+
+type wrapFileInfo struct {
+	fs.FileInfo
+
+	sys any
+}
+
+func (w *wrapFileInfo) Sys() any { return w.sys }
+
+func (f ioFS) Stat(name string) (fs.FileInfo, error) {
+	if f.preProcessName != nil {
+		name = f.preProcessName(name)
+	}
+
+	if name == "/" {
+		name = "."
+	} else {
+		name = strings.TrimPrefix(name, "/")
+	}
+
+	info, err := f.fsys.Stat(name)
+	if err != nil {
+		return nil, err
+	}
+	return &wrapFileInfo{FileInfo: info, sys: f}, nil
 }
 
 func (f ioFS) Remove(name string) error {

@@ -19,7 +19,9 @@ package iceberg
 
 import (
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -394,4 +396,48 @@ func (rewriteNotVisitor) VisitUnbound(pred UnboundPredicate) BooleanExpression {
 
 func (rewriteNotVisitor) VisitBound(pred BoundPredicate) BooleanExpression {
 	return pred
+}
+
+type expressionFieldIDs struct{}
+
+func (expressionFieldIDs) VisitTrue() map[int]struct{} {
+	return map[int]struct{}{}
+}
+
+func (expressionFieldIDs) VisitFalse() map[int]struct{} {
+	return map[int]struct{}{}
+}
+
+func (expressionFieldIDs) VisitNot(child map[int]struct{}) map[int]struct{} {
+	return child
+}
+
+func (expressionFieldIDs) VisitAnd(left, right map[int]struct{}) map[int]struct{} {
+	maps.Insert(left, maps.All(right))
+	return left
+}
+
+func (expressionFieldIDs) VisitOr(left, right map[int]struct{}) map[int]struct{} {
+	maps.Insert(left, maps.All(right))
+	return left
+}
+
+func (expressionFieldIDs) VisitUnbound(UnboundPredicate) map[int]struct{} {
+	panic("expression field IDs only works for bound expressions")
+}
+
+func (expressionFieldIDs) VisitBound(pred BoundPredicate) map[int]struct{} {
+	return map[int]struct{}{
+		pred.Ref().Field().ID: {},
+	}
+}
+
+func ExtractFieldIDs(expr BooleanExpression) ([]int, error) {
+	res, err := VisitExpr(expr, expressionFieldIDs{})
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]int, 0, len(res))
+	return slices.AppendSeq(out, maps.Keys(res)), nil
 }
