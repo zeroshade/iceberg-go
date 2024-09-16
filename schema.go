@@ -756,7 +756,7 @@ func (i *indexByName) AfterField(field NestedField) {
 // provided selected set. Parent fields of a selected child will be retained.
 func PruneColumns(schema *Schema, selected map[int]Void, selectFullTypes bool) (*Schema, error) {
 
-	result, err := Visit[Type](schema, &pruneColVisitor{selected: selected,
+	result, err := Visit(schema, &pruneColVisitor{selected: selected,
 		fullTypes: selectFullTypes})
 	if err != nil {
 		return nil, err
@@ -1067,4 +1067,89 @@ func (buildPosAccessors) Primitive(PrimitiveType) map[int]accessor {
 
 func buildAccessors(schema *Schema) (map[int]accessor, error) {
 	return Visit(schema, buildPosAccessors{})
+}
+
+type SchemaWithPartnerVisitor[T, P any] interface {
+	Schema(sc *Schema, schemaPartner P, structResult T) T
+	Struct(st StructType, structPartner P, fieldResults []T) T
+	Field(field NestedField, fieldPartner P, fieldResult T) T
+	List(listType ListType, listPartner P, elemResult T) T
+	Map(mapType MapType, mapPartner P, keyResult, valResult T) T
+	Primitive(p PrimitiveType, primitivePartner P) T
+}
+
+type PartnerAccessor[P any] interface {
+	SchemaPartner(partner P) P
+	FieldPartner(partnerStruct P, fieldId int, fieldName string) P
+	ListElementPartner(partnerList P) P
+	MapKeyPartner(partnerMap P) P
+	MapValuePartner(partnerMap P) P
+}
+
+func VisitWithPartner[T, P any](sc *Schema, partner P, visitor SchemaWithPartnerVisitor[T, P], accessor PartnerAccessor[P]) (res T, err error) {
+	if sc == nil {
+		err = fmt.Errorf("%w: cannot visit nil schema", ErrInvalidArgument)
+		return
+	}
+
+	if visitor == nil || accessor == nil {
+		err = fmt.Errorf("%w: cannot visit with nil visitor or accessor", ErrInvalidArgument)
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			switch e := r.(type) {
+			case string:
+				err = fmt.Errorf("error encountered during schema visitor: %s", e)
+			case error:
+				err = fmt.Errorf("error encountered during schema visitor: %w", e)
+			}
+		}
+	}()
+
+	structPartner := accessor.SchemaPartner(partner)
+	return visitor.Schema(sc, partner, visitStructWithPartner(sc.AsStruct(), structPartner, visitor, accessor)), nil
+}
+
+func visitStructWithPartner[T, P any](st StructType, partner P, visitor SchemaWithPartnerVisitor[T, P], accessor PartnerAccessor[P]) T {
+	fieldResults := make([]T, len(st.FieldList))
+
+	for i, f := range st.FieldList {
+		fieldPartner := accessor.FieldPartner(partner, f.ID, f.Name)
+		fieldResult := visitTypeWithPartner(f.Type, fieldPartner, visitor, accessor)
+		fieldResults[i] = visitor.Field(f, fieldPartner, fieldResult)
+	}
+
+	return visitor.Struct(st, partner, fieldResults)
+}
+
+func visitListWithPartner[T, P any](listType ListType, partner P, visitor SchemaWithPartnerVisitor[T, P], accessor PartnerAccessor[P]) T {
+	elemPartner := accessor.ListElementPartner(partner)
+	elemResult := visitTypeWithPartner(listType.Element, elemPartner, visitor, accessor)
+
+	return visitor.List(listType, partner, elemResult)
+}
+
+func visitMapWithPartner[T, P any](m MapType, partner P, visitor SchemaWithPartnerVisitor[T, P], accessor PartnerAccessor[P]) T {
+	keyPartner := accessor.MapKeyPartner(partner)
+	keyResult := visitTypeWithPartner(m.KeyType, keyPartner, visitor, accessor)
+
+	valPartner := accessor.MapValuePartner(partner)
+	valResult := visitTypeWithPartner(m.ValueType, valPartner, visitor, accessor)
+
+	return visitor.Map(m, partner, keyResult, valResult)
+}
+
+func visitTypeWithPartner[T, P any](t Type, fieldPartner P, visitor SchemaWithPartnerVisitor[T, P], accessor PartnerAccessor[P]) T {
+	switch t := t.(type) {
+	case *ListType:
+		return visitListWithPartner(*t, fieldPartner, visitor, accessor)
+	case *StructType:
+		return visitStructWithPartner(*t, fieldPartner, visitor, accessor)
+	case *MapType:
+		return visitMapWithPartner(*t, fieldPartner, visitor, accessor)
+	default:
+		return visitor.Primitive(t.(PrimitiveType), fieldPartner)
+	}
 }

@@ -26,7 +26,6 @@ import (
 	"slices"
 
 	"github.com/apache/iceberg-go"
-
 	"github.com/google/uuid"
 )
 

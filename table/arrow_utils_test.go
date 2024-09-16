@@ -113,7 +113,7 @@ func TestArrowToIceberg(t *testing.T) {
 			assert.True(t, ice.Equals(tt.ice), ice)
 
 			if tt.reciprocal {
-				out, err := typeToArrowType(ice)
+				out, err := typeToArrowType(ice, true)
 				require.NoError(t, err)
 				assert.Truef(t, arrow.TypeEqual(tt.dt, out), "expected: %s\ngot: %s", tt.dt, out)
 			}

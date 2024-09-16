@@ -19,6 +19,8 @@ package table
 
 import (
 	"context"
+	"errors"
+	"io"
 	"iter"
 	"runtime"
 
@@ -26,40 +28,25 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/compute/exprs"
-	"github.com/apache/arrow-go/v18/arrow/dataset"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/metadata"
 	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/io"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table/parquet"
 	"github.com/substrait-io/substrait-go/expr"
 	"golang.org/x/sync/errgroup"
 )
 
-func constructFragment(fs io.IO, dataFile iceberg.DataFile) (dataset.Fragment, error) {
-	format := dataset.ParquetFileFormat{ReaderOptions: struct{ DictCols []string }{
-		[]string{"file_path"}}}
-
-	return dataset.NewFileFragment(format, fs, dataFile.FilePath())
-}
-
-func readDeletes(fs io.IO, dataFile iceberg.DataFile) (map[string]*arrow.Chunked, error) {
-	frag, err := constructFragment(fs, dataFile)
+func readDeletes(fs iceio.IO, dataFile iceberg.DataFile) (map[string]*arrow.Chunked, error) {
+	src := parquet.FileSource{Fs: fs, File: dataFile}
+	rdr, err := src.GetReader(true)
 	if err != nil {
 		return nil, err
 	}
-
-	scanner, err := dataset.NewScannerFromFragment(frag, &dataset.ScanOptions{
-		BatchReadahead:    dataset.DefaultBatchReadahead,
-		FragmentReadahead: 1,
-		BatchSize:         dataset.DefaultBatchSize,
-		Mem:               memory.DefaultAllocator,
-	})
-	if err != nil {
-		return nil, err
-	}
+	defer rdr.ParquetReader().Close()
 
 	ctx := context.Background()
-
-	tbl, err := scanner.ToTable(context.Background())
+	tbl, err := rdr.ReadTable(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +84,7 @@ func readDeletes(fs io.IO, dataFile iceberg.DataFile) (map[string]*arrow.Chunked
 	return results, nil
 }
 
-func readAllDeleteFiles(fs io.IO, tasks []FileScanTask) (map[string][]*arrow.Chunked, error) {
+func readAllDeleteFiles(fs iceio.IO, tasks []FileScanTask) (map[string][]*arrow.Chunked, error) {
 	deletesPerFile := make(map[string][]*arrow.Chunked)
 	uniqueDeletes := map[string]iceberg.DataFile{}
 	for _, t := range tasks {
@@ -155,136 +142,143 @@ func combinePositionalDeletes(deletes map[int64]struct{}, start, end int64) arro
 
 type arrowScan struct {
 	metadata        Metadata
-	fs              io.IO
+	fs              iceio.IO
 	projectedSchema *iceberg.Schema
 	boundRowFilter  iceberg.BooleanExpression
 	caseSensitive   bool
 	rowLimit        int64
 }
 
+func filterRecords(ctx context.Context, recordFilter expr.Expression) func(arrow.Record) (arrow.Record, error) {
+	return func(rec arrow.Record) (arrow.Record, error) {
+		input := compute.NewDatumWithoutOwning(rec)
+		mask, err := exprs.ExecuteScalarExpression(ctx, rec.Schema(), recordFilter, input)
+		if err != nil {
+			return nil, err
+		}
+
+		result, err := compute.Filter(ctx, input, mask, *compute.DefaultFilterOptions())
+		if err != nil {
+			return nil, err
+		}
+
+		mask.Release()
+
+		return result.(*compute.RecordDatum).Value, nil
+	}
+}
+
+func toRequestedSchema(fileSchema, projectedSchema *iceberg.Schema) func(arrow.Record) (arrow.Record, error) {
+	return func(rec arrow.Record) (arrow.Record, error) {
+		defer rec.Release()
+		st := array.RecordToStructArray(rec)
+		defer st.Release()
+
+		result, err := iceberg.VisitWithPartner[arrow.Array, arrow.Array](
+			projectedSchema, st,
+			&arrowProjectionVisitor{fileSchema: fileSchema, includeFieldIDs: true, useLargeTypes: false},
+			arrowAccessor{fileSchema: fileSchema})
+		if err != nil {
+			return nil, err
+		}
+
+		return array.RecordFromStructArray(result.(*array.Struct), nil), nil
+	}
+}
+
+func processPositionalDeletes(ctx context.Context, deletes map[int64]struct{}) func(arrow.Record) (arrow.Record, error) {
+	nextIdx := int64(0)
+	return func(rec arrow.Record) (arrow.Record, error) {
+		defer rec.Release()
+
+		currentIdx := nextIdx
+		nextIdx += rec.NumRows()
+
+		indices := combinePositionalDeletes(deletes, currentIdx, nextIdx)
+		defer indices.Release()
+
+		out, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
+			compute.NewDatumWithoutOwning(rec), compute.NewDatumWithoutOwning(indices))
+		if err != nil {
+			return nil, err
+		}
+
+		return out.(*compute.RecordDatum).Value, nil
+	}
+}
+
 func (as *arrowScan) taskToRecordBatches(task FileScanTask, positionalDeletes []*arrow.Chunked) (iter.Seq2[arrow.Record, error], error) {
-	arrowFmt := dataset.ParquetFileFormat{}
-	frag, err := arrowFmt.FragmentFromFile(as.fs, task.File.FilePath(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	physicalSchema, err := frag.ReadPhysicalSchema()
-	if err != nil {
-		return nil, err
-	}
-
-	fileSchema, err := arrowToIceberg(physicalSchema)
-	if err != nil {
-		return nil, err
-	}
-
 	ids, err := as.projectedFieldIDs()
 	if err != nil {
 		return nil, err
 	}
 
-	outschema, err := iceberg.PruneColumns(fileSchema, ids, false)
-	if err != nil {
-		return nil, err
+	src := parquet.FileSource{
+		Fs:   as.fs,
+		File: task.File,
 	}
 
-	exprSchema, err := schemaToArrow(outschema, nil, true)
+	rdr, err := src.GetReader(false)
 	if err != nil {
 		return nil, err
 	}
+	defer rdr.ParquetReader().Close()
 
 	extSet := exprs.NewDefaultExtensionSet()
 	ctx := exprs.WithExtensionIDSet(context.Background(), extSet)
 
-	var datasetFilter expr.Expression
-	if as.boundRowFilter != nil && !as.boundRowFilter.Equals(iceberg.AlwaysTrue{}) {
-		bldr := exprs.NewExprBuilder(extSet)
-		if err := bldr.SetInputSchema(exprSchema); err != nil {
-			return nil, err
-		}
-		datasetFilter, err = iceberg.VisitExpr(as.boundRowFilter, convertToArrowExpr{bldr: bldr})
+	fschema, colIds, recordFilter, err := src.Prep(ctx, rdr, ids, as.boundRowFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	var testRg func(*metadata.RowGroupMetaData, []int) (bool, error)
+	if rdr.ParquetReader().NumRowGroups() > 1 {
+		testRg, err = newParquetRowGroupStatsEvaluator(fschema, as.boundRowFilter, as.caseSensitive, false)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	cols := make([]compute.FieldPath, outschema.NumFields())
-	for i, f := range outschema.Fields() {
-		ref, _ := compute.FieldRefName(f.Name).FindOne(physicalSchema)
-		cols[i] = ref
-	}
-
-	scanner, err := dataset.NewScannerFromFragment(frag, &dataset.ScanOptions{
-		Filter:            datasetFilter,
-		Columns:           cols,
-		BatchReadahead:    dataset.DefaultBatchReadahead,
-		FragmentReadahead: 1,
-		BatchSize:         dataset.DefaultBatchSize,
-		Mem:               memory.DefaultAllocator,
-		FormatOptions:     arrowFmt.DefaultFragmentScanOptions(),
-	})
-
+	recRdr, err := src.ReadData(rdr, colIds, testRg)
 	if err != nil {
 		return nil, err
 	}
 
-	ch, err := scanner.ScanBatches(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	deletes := make(map[int64]struct{})
-	for _, c := range positionalDeletes {
-		for _, a := range c.Chunks() {
-			for _, v := range a.(*array.Int64).Int64Values() {
-				deletes[v] = struct{}{}
+	pipeline := make([]func(arrow.Record) (arrow.Record, error), 0, 2)
+	if len(positionalDeletes) > 0 {
+		deletes := make(map[int64]struct{})
+		for _, c := range positionalDeletes {
+			for _, a := range c.Chunks() {
+				for _, v := range a.(*array.Int64).Int64Values() {
+					deletes[v] = struct{}{}
+				}
 			}
 		}
+		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes))
 	}
 
-	drain := func() {
-		for rec := range ch {
-			if rec.RecordBatch != nil {
-				rec.RecordBatch.Release()
-			}
-		}
-	}
-
+	pipeline = append(pipeline, filterRecords(ctx, recordFilter), toRequestedSchema(fschema, as.projectedSchema))
 	return func(yield func(arrow.Record, error) bool) {
-		defer drain()
+		defer recRdr.Release()
+		var err error
+		for recRdr.Next() {
+			rec := recRdr.Record()
 
-		nextIdx := int64(0)
-		for rec := range ch {
-			if rec.Err != nil {
-				yield(nil, rec.Err)
-				return
-			}
-			defer rec.RecordBatch.Release()
-
-			result := rec.RecordBatch
-			currentIdx := nextIdx
-			nextIdx += rec.RecordBatch.NumRows()
-			if len(positionalDeletes) > 0 {
-				indices := combinePositionalDeletes(deletes, currentIdx, nextIdx)
-				defer indices.Release()
-				out, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
-					compute.NewDatumWithoutOwning(rec.RecordBatch),
-					compute.NewDatumWithoutOwning(indices))
+			for _, p := range pipeline {
+				rec, err = p(rec)
 				if err != nil {
 					yield(nil, err)
 					return
 				}
-				defer out.Release()
-
-				result = out.(*compute.RecordDatum).Value
-				// apply filter
 			}
 
-			result.Retain()
-			if !yield(result, nil) {
+			if !yield(rec, nil) {
 				return
 			}
+		}
+		if recRdr.Err() != nil && !errors.Is(recRdr.Err(), io.EOF) {
+			yield(nil, recRdr.Err())
 		}
 	}, nil
 }

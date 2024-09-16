@@ -96,7 +96,8 @@ func TestScanning(t *testing.T) {
 	require.NoError(t, err)
 
 	scan := tbl.Scan(
-		iceberg.GreaterThanEqual(iceberg.Reference("letter"), "e"),
+		iceberg.NewAnd(iceberg.GreaterThanEqual(iceberg.Reference("letter"), "e"),
+			iceberg.LessThan(iceberg.Reference("letter"), "k")),
 		0, true, "number")
 	result, err := scan.ToArrow(context.Background())
 	fmt.Println(err)
