@@ -18,6 +18,7 @@
 package internal
 
 import (
+	"fmt"
 	"io"
 )
 
@@ -31,4 +32,15 @@ func (w *CountingWriter) Write(p []byte) (int, error) {
 	w.Count += int64(n)
 
 	return n, err
+}
+
+func RecoverError(err *error) {
+	if r := recover(); r != nil {
+		switch e := r.(type) {
+		case string:
+			*err = fmt.Errorf("error encountered during arrow schema visitor: %s", e)
+		case error:
+			*err = fmt.Errorf("error encountered during arrow schema visitor: %w", e)
+		}
+	}
 }
