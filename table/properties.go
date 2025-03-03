@@ -20,6 +20,14 @@ package table
 const (
 	DefaultNameMappingKey = "schema.name-mapping.default"
 
+	WriteDataPathKey                        = "write.data.path"
+	WriteMetadataPathKey                    = "write.metadata.path"
+	WriteObjectStorePartitionedPathsKey     = "write.object-storage.partitioned-paths"
+	WriteObjectStorePartitionedPathsDefault = true
+
+	ObjectStoreEnabledKey     = "write.object-storage.enabled"
+	ObjectStoreEnabledDefault = false
+
 	MetricsModeColumnConfPrefix = "write.metadata.metrics.column"
 
 	DefaultWriteMetricsModeKey     = "write.metadata.metrics.default"
